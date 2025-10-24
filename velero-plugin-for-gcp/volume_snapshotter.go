@@ -232,6 +232,7 @@ func (b *VolumeSnapshotter) CreateVolumeFromSnapshot(snapshotID, volumeType, vol
 		SourceSnapshot: res.SelfLink,
 		Type:           volumeType,
 		Description:    res.Description,
+		Labels:         res.Labels,
 	}
 
 	if isMultiZone(volumeAZ) {
@@ -375,23 +376,36 @@ func (b *VolumeSnapshotter) createSnapshot(snapshotName, volumeID, volumeAZ stri
 		return "", errors.WithStack(err)
 	}
 
-	gceSnap := compute.Snapshot{
+	snapshot := &compute.Snapshot{
 		Name:         snapshotName,
 		Description:  getSnapshotTags(tags, disk.Description, b.log),
 		SourceDisk:   disk.SelfLink,
 		SnapshotType: b.snapshotType,
+		Labels:       disk.Labels,
 	}
 
 	if b.snapshotLocation != "" {
-		gceSnap.StorageLocations = []string{b.snapshotLocation}
+		snapshot.StorageLocations = []string{b.snapshotLocation}
 	}
 
-	_, err = b.gce.Snapshots.Insert(b.snapshotProject, &gceSnap).Do()
-	if err != nil {
+	// Try creating snapshot with labels
+	_, err = b.gce.Snapshots.Insert(b.snapshotProject, snapshot).Do()
+
+	// If we get a permission error for labels, retry without them
+	if err != nil && isLabelPermissionError(err) {
+		b.log.WithError(err).Warn("Missing compute.snapshots.setLabels permission, creating snapshot without labels")
+
+		// Retry without labels
+		snapshot.Labels = nil
+		_, err = b.gce.Snapshots.Insert(b.snapshotProject, snapshot).Do()
+		if err != nil {
+			return "", errors.WithStack(err)
+		}
+	} else if err != nil {
 		return "", errors.WithStack(err)
 	}
 
-	return gceSnap.Name, nil
+	return snapshot.Name, nil
 }
 
 func (b *VolumeSnapshotter) createRegionSnapshot(snapshotName, volumeID, volumeRegion string, tags map[string]string) (string, error) {
@@ -405,6 +419,7 @@ func (b *VolumeSnapshotter) createRegionSnapshot(snapshotName, volumeID, volumeR
 		Description:  getSnapshotTags(tags, disk.Description, b.log),
 		SourceDisk:   disk.SelfLink,
 		SnapshotType: b.snapshotType,
+		Labels:       disk.Labels,
 	}
 
 	if b.snapshotLocation != "" {
@@ -553,4 +568,17 @@ func (b *VolumeSnapshotter) IsVolumeCreatedCrossProjects(volumeHandle string) bo
 	}
 
 	return false
+}
+
+// isLabelPermissionError Helper function to detect label permission errors
+func isLabelPermissionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for specific GCP permission error
+	// This might need adjustment based on actual error format
+	errStr := err.Error()
+	return strings.Contains(errStr, "compute.snapshots.setLabels") ||
+		(strings.Contains(errStr, "permission") && strings.Contains(errStr, "label"))
 }
